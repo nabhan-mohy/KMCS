@@ -1,5 +1,7 @@
-(empty)node_modules/
-.next/
-dist/
-build/
-*.log
+# Compiled and build artifacts
+__pycache__/
+*.pyc
+
+# Dependencies
+.venv/
+venv/
