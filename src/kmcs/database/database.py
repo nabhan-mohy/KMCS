@@ -314,6 +314,9 @@ class DatabaseManager:
     @contextmanager
     def session(self) -> Iterator[Session]:
         """Yield a session; commit on clean exit, rollback on error."""
+        if self._closed:
+            raise DatabaseError("database manager is closed",
+                                component="database.database")
         self.initialize()
         session = self.session_factory()
         try:
@@ -623,10 +626,18 @@ class DatabaseManager:
         with self.session() as session:
             if crash.campaign_id and not session.get(CampaignRow,
                                                      crash.campaign_id):
-                raise NotFoundError(
-                    f"crash references unknown campaign "
-                    f"'{crash.campaign_id}'",
-                    component="database.database")
+                # Referential integrity: create the campaign shell from the
+                # crash's own metadata instead of hard-failing.  This keeps
+                # the FK constraint real (no orphan rows) while remaining
+                # idempotent — a later save_campaign() upserts onto this row.
+                session.add(CampaignRow(
+                    id=crash.campaign_id,
+                    name=f"auto:{crash.campaign_id}",
+                    target_id=crash.target_id or "",
+                    engine=crash.engine or "unknown",
+                    status="recorded",
+                ))
+                session.flush()
             row = session.get(CrashRow, crash.id)
             fresh = CrashRow.from_domain(crash)
             if row is None:
