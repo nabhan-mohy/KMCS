@@ -73,8 +73,10 @@ __all__: List[str] = [
     "uncaught_errors",
     # base
     "KMCSBaseError",
+    "KMCSException",
     "KMCSRuntimeError",
     "KMCSValueError",
+    "InvalidValueError",
     "KMCSTypeError",
     "KMCSNotImplementedError",
     "KMCSOSError",
@@ -2511,6 +2513,30 @@ class UnsupportedOperationError(KMCSNotImplementedError):
     default_code = ErrorCode.UNSUPPORTED
     default_status = 501
     remediation = ("Track this capability in the phase plan; it is intentionally not built yet.")
+
+
+# ---------------------------------------------------------------------------
+# compatibility aliases
+# ---------------------------------------------------------------------------
+#
+# Earlier design drafts referred to the root of the taxonomy as
+# ``KMCSException`` and exposed a dedicated invalid-value error.  Both names
+# are part of the public contract now, so they alias onto the canonical
+# classes defined above instead of introducing parallel hierarchies:
+#
+#   KMCSException      -> KMCSBaseError   (root of every KMCS failure)
+#   InvalidValueError  -> KMCSValueError  (tolerant enum / value parsing)
+#
+# Aliasing (rather than subclassing) keeps ``except KMCSBaseError`` working
+# for code that raises either spelling, and keeps the registry, serialisation
+# and formatting utilities single-sourced.
+
+#: Alias kept for API compatibility with earlier core drafts.
+KMCSException = KMCSBaseError
+
+#: Raised by :mod:`kmcs.core.models` when a value cannot be coerced into one
+#: of the domain enumerations (severity, engine kind, sanitizer kind, ...).
+InvalidValueError = KMCSValueError
 
 
 # ---------------------------------------------------------------------------

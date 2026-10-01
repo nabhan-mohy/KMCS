@@ -1231,10 +1231,60 @@ class RunStatus(StrEnum):
         return str(self.value) == "completed"
 
 
-class CampaignStatus(RunStatus):
-    """Alias namespace with an extra warm-up state for campaign code paths."""
+class CampaignStatus(StrEnum):
+    """Lifecycle status of a fuzzing campaign.
 
+    Python 3.11+ forbids subclassing an enum that already has members, so
+    this is a *sibling* of :class:`RunStatus` rather than a child.  Every
+    value is shared with ``RunStatus`` (plus the campaign-only ``WARMUP``
+    state), and the interop helpers below guarantee the two vocabularies
+    stay in lock-step: any :class:`RunStatus` member converts to the equal
+    :class:`CampaignStatus` member and vice versa.
+    """
+
+    PENDING = "pending"
+    QUEUED = "queued"
+    PREPARING = "preparing"
     WARMUP = "warmup"
+    RUNNING = "running"
+    PAUSED = "paused"
+    STOPPING = "stopping"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    CRASHED = "crashed"
+    TIMED_OUT = "timed-out"
+    ABORTED = "aborted"
+    UNKNOWN = "unknown"
+
+    @property
+    def terminal(self) -> bool:
+        return str(self.value) in {"completed", "failed", "cancelled", "crashed", "timed-out", "aborted"}
+
+    @property
+    def active(self) -> bool:
+        return str(self.value) in {"warmup", "preparing", "running", "paused", "stopping"}
+
+    @property
+    def successful(self) -> bool:
+        return str(self.value) == "completed"
+
+    def as_run_status(self) -> "RunStatus":
+        """Map onto the equivalent generic :class:`RunStatus` member."""
+        return RunStatus.coerce(self.value if self is not CampaignStatus.WARMUP else RunStatus.PREPARING.value)
+
+    @classmethod
+    def from_run_status(cls, value: Any) -> "CampaignStatus":
+        """Coerce any run/campaign status token into a :class:`CampaignStatus`."""
+        resolved = RunStatus.coerce(value)
+        return cls.coerce(resolved.value)
+
+    @classmethod
+    def shared_values(cls) -> List[str]:
+        """Values common to both enums (the compatibility surface)."""
+        mine = {str(member.value) for member in cls}
+        theirs = {str(member.value) for member in RunStatus}
+        return sorted(mine & theirs)
 
 
 class JobStateName(StrEnum):
@@ -3503,6 +3553,13 @@ def derive_severity(crash: Any, *, factors: Optional[Mapping[str, Any]] = None) 
     reproducibility rate and sanitizer origin.  No exploitability scoring is
     performed — that would cross the project's security boundary.
     """
+    if isinstance(crash, CrashClass):
+        # Convenience: severity of a bare classification token.
+        return severity_from_crash_class(crash)
+    if isinstance(crash, str):
+        resolved = CrashClass.try_parse(crash)
+        if resolved is not None:
+            return severity_from_crash_class(resolved)
     if isinstance(crash, Mapping):
         crash_class = crash.get("crash_class", CrashClass.UNKNOWN.value)
         access = crash.get("memory_access")
