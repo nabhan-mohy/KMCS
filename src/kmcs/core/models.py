@@ -148,6 +148,36 @@ def utc_string(value: Optional[datetime] = None) -> str:
 default_timestamp = utc_string
 
 
+def normalise_name(name: Any, *, separator: str = "_") -> str:
+    """Canonical lower-case identifier with *separator*-joined words.
+
+    ``"LeakSanitizer (LSan)"`` → ``"leaksanitizer_lsan"``.  Used for DB keys,
+    report filenames and config section names.
+    """
+    import re as _re
+
+    text = str(name or "").strip().lower()
+    parts = _re.split(r"[^a-z0-9]+", text)
+    return separator.join(p for p in parts if p)
+
+
+def to_snake(name: Any) -> str:
+    """Convert CamelCase / kebab-case / spaced names to snake_case."""
+    import re as _re
+
+    text = str(name or "").strip()
+    text = _re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", text)
+    text = _re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", text)
+    text = _re.sub(r"[^A-Za-z0-9]+", "_", text)
+    return text.strip("_").lower()
+
+
+def to_title(name: Any, *, sep: str = " ") -> str:
+    """Human-friendly Title Case rendering of any identifier-ish string."""
+    words = str(name or "").replace("_", sep).replace("-", sep).split(sep)
+    return sep.join(w[:1].upper() + w[1:] if w else "" for w in words if w)
+
+
 def parse_timestamp(value: Any) -> Optional[datetime]:
     """Best-effort parser returning an aware UTC datetime (or ``None``)."""
     if value is None:
