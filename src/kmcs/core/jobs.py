@@ -1499,18 +1499,58 @@ class JobEngine:
             self._dispatcher.start()
 
     def submit_all(self) -> int:
-        """Move every CREATED job with satisfied deps toward PENDING."""
+        """Move every CREATED job with satisfied deps toward PENDING.
+
+        Jobs whose dependencies are all registered stay CREATED until a
+        dependency succeeds (:meth:`_propagate_terminal` promotes them);
+        jobs that reference an unknown/missing dependency can never have
+        it satisfied, so they are marked BLOCKED immediately (honest
+        accounting rather than silent starvation).
+        """
         submitted = 0
         with self._lock:
             for item in self._items.values():
-                if item.state is JobState.CREATED:
-                    if item.unmet:
-                        item.transition(JobState.CREATED, "noop")  # stays
-                    else:
-                        item.transition(JobState.PENDING, "submit")
-                        submitted += 1
-                        self._cv.notify_all()
+                if item.state is not JobState.CREATED:
+                    continue
+                missing = [d for d in item.definition.depends_on
+                           if d not in self._items]
+                if missing:
+                    item.transition(
+                        JobState.BLOCKED,
+                        f"unknown dependency: {', '.join(missing)}")
+                    item.last_error = ("dependency not registered: "
+                                       + ", ".join(missing))
+                    self._cascade_blocked(item)
+                    continue
+                if not item.unmet:
+                    item.transition(JobState.PENDING, "submit")
+                    submitted += 1
+                    self._cv.notify_all()
         return submitted
+
+    def _cascade_blocked(self, source: WorkItem) -> None:
+        """Mark transitive dependents of a blocked/failed job BLOCKED."""
+        if self.continue_on_failure:
+            return
+        queue = deque(source.dependents)
+        seen: Set[str] = set()
+        while queue:
+            cid = queue.popleft()
+            if cid in seen:
+                continue
+            seen.add(cid)
+            child = self._items.get(cid)
+            if child is None or child.state.is_terminal():
+                continue
+            if child.state in (JobState.CREATED, JobState.PENDING,
+                               JobState.BLOCKED):
+                if child.state is not JobState.BLOCKED:
+                    child.transition(
+                        JobState.BLOCKED,
+                        f"dependency {source.definition.id} blocked")
+                    child.last_error = (
+                        f"upstream {source.definition.id} cannot run")
+                queue.extend(child.dependents)
 
     def _dispatch_loop(self) -> None:
         while not self._stop.is_set():
@@ -1695,27 +1735,28 @@ class JobEngine:
                 self._cv.notify_all()
 
     def _propagate_terminal(self, item: WorkItem) -> None:
-        """On failure/cancel, block dependents transitively (unless continuing)."""
-        if item.state in (JobState.SUCCEEDED,):
-            # unblock waiting dependents whose dep just succeeded
-            for dep_id in item.definition.depends_on:
-                dep = self._items.get(dep_id)
-                if dep:
-                    item.unmet.discard(dep_id)
-            if not item.unmet and item.state is JobState.SUCCEEDED:
-                for child_id in item.dependents:
-                    child = self._items.get(child_id)
-                    if child and child.state is JobState.BLOCKED:
-                        child.unmet.discard(item.definition.id)
-                        if not (child.unmet - {p for p in child.unmet
-                                               if self._items.get(p) is None
-                                               or self._items[p].state
-                                               in (JobState.FAILED,
-                                                   JobState.CANCELLED,
-                                                   JobState.TIMED_OUT,
-                                                   JobState.BLOCKED)}):
-                            child.transition(JobState.PENDING, "dep-recovered")
-                            self._cv.notify_all()
+        """Advance the DAG after a job reaches a terminal state.
+
+        * SUCCEEDED → drop it from dependents' ``unmet`` sets and promote
+          any dependent (CREATED or BLOCKED-by-recoverable-deps) whose
+          remaining prerequisites are all satisfied.
+        * FAILED / TIMED_OUT / CANCELLED / BLOCKED → transitively block
+          dependents (unless ``continue_on_failure``).
+        """
+        if item.state is JobState.SUCCEEDED:
+            for child_id in item.dependents:
+                child = self._items.get(child_id)
+                if child is None or child.state.is_terminal():
+                    continue
+                child.unmet.discard(item.definition.id)
+                if child.unmet:
+                    continue  # still waiting on other prerequisites
+                if child.state in (JobState.CREATED, JobState.BLOCKED):
+                    # BLOCKED -> PENDING requires the legal transition;
+                    # CREATED -> PENDING likewise. Both are whitelisted.
+                    child.transition(JobState.PENDING,
+                                     f"dependency {item.definition.id} ok")
+                    self._cv.notify_all()
             return
         if self.continue_on_failure:
             return
@@ -1735,6 +1776,17 @@ class JobEngine:
                     child.transition(JobState.BLOCKED,
                                      f"dependency {item.definition.id} "
                                      f"{item.state.value}")
+                    child.last_error = (
+                        f"upstream {item.definition.id} "
+                        f"{item.state.value}")
+                # Finalise the BLOCKED result so wait()/run_foreground()
+                # return an honest terminal record for it too.
+                if child.result is None:
+                    child.finish(JobResult(
+                        job_id=child.definition.id, state=JobState.BLOCKED,
+                        error=None, attempts=0,
+                        started_at=self.started_at,
+                        finished_at=_monotonic()))
                 blocked.extend(child.dependents)
 
     # -- public control -------------------------------------------------------------------
@@ -1759,6 +1811,27 @@ class JobEngine:
             with self._lock:
                 pending = [i for i in self._items.values()
                            if not i.state.is_terminal()]
+                # Jobs that can never run (unknown deps, blocked upstream)
+                # are finalised here so quiescence means *quiescence*, not
+                # merely "nothing running".
+                for item in list(pending):
+                    if item.state is JobState.CREATED and item.unmet:
+                        missing = [d for d in item.definition.depends_on
+                                   if d not in self._items]
+                        if missing:
+                            item.transition(
+                                JobState.BLOCKED,
+                                f"unknown dependency: {', '.join(missing)}")
+                            item.last_error = ("dependency not registered: "
+                                               + ", ".join(missing))
+                            item.finish(JobResult(
+                                job_id=item.definition.id,
+                                state=JobState.BLOCKED,
+                                error=None, attempts=0,
+                                started_at=self.started_at,
+                                finished_at=_monotonic()))
+                            pending.remove(item)
+                            self._cascade_blocked(item)
             if not pending:
                 return None
             if deadline is not None and time.monotonic() >= deadline:
