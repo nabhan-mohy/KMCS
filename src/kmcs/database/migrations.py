@@ -1368,14 +1368,37 @@ class MigrationRunner:
             raw.close()
 
     def _sync_manager_version(self, version: int) -> None:
-        if self.manager is None:
-            return
-        try:
-            self.manager.set_setting(
-                "schema.version", version, category="system"
+        """Keep the ``schema.version`` marker in sync after a migration run.
+
+        Prefers an attached :class:`DatabaseManager`; otherwise writes (or
+        upserts) the marker row directly through SQL so standalone engines —
+        which never go through ``DatabaseManager._stamp_version`` — still have
+        a single, consistent source of truth for the live schema version.
+        """
+        if self.manager is not None:
+            try:
+                self.manager.set_setting(
+                    "schema.version", version, category="system"
+                )
+                return
+            except Exception as exc:  # manager may expose different signature
+                LOGGER.debug("could not sync manager version: %s", exc)
+        now = datetime.now(timezone.utc).isoformat()
+        value_json = json.dumps(version)
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO settings (key, value_json, category,"
+                    " description, updated_at)"
+                    " VALUES ('schema.version', :v, 'system',"
+                    " 'ORM schema version marker', :t)"
+                    " ON CONFLICT(key) DO UPDATE SET"
+                    " value_json = excluded.value_json,"
+                    " category = excluded.category,"
+                    " updated_at = excluded.updated_at"
+                ),
+                {"v": value_json, "t": now},
             )
-        except Exception as exc:  # manager may expose different signature
-            LOGGER.debug("could not sync manager version: %s", exc)
 
 
 def read_current_version_quiet(engine: Engine) -> int:

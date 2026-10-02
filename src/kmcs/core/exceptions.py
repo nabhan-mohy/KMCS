@@ -2035,8 +2035,14 @@ class ToolNotFoundError(EnvironmentErrorDetail):
             details=details,
             **kw,
         )
-        self.tool = tool
-        self.searched = tuple(str(p) for p in searched)
+        # ``tool`` itself is a read-only property backed by the error context
+        # (set via the ``tool=`` kwarg above); store the extra facts under
+        # private names and expose them through properties below.
+        self._searched = tuple(str(p) for p in searched)
+
+    @property
+    def searched(self) -> Tuple[str, ...]:
+        return self._searched
 
 
 class ToolVersionError(EnvironmentErrorDetail):
@@ -2047,9 +2053,16 @@ class ToolVersionError(EnvironmentErrorDetail):
         details = dict(kw.pop("details", None) or {})
         details.update({"tool": tool, "found_version": found, "required_version": required})
         super().__init__(f"{tool} version '{found}' does not satisfy requirement '{required}'", tool=tool, details=details, **kw)
-        self.tool = tool
-        self.found = found
-        self.required = required
+        self._found_version = found
+        self._required_version = required
+
+    @property
+    def found(self) -> str:
+        return self._found_version
+
+    @property
+    def required(self) -> str:
+        return self._required_version
 
 
 class CompilerNotFoundError(ToolNotFoundError):

@@ -1475,8 +1475,24 @@ class ModelProtocol:
         raise NotImplementedError
 
 
-def _slug_token(text: Any) -> str:
-    token = re.sub(r"[^a-z0-9]+", "_", str(text or "").strip().lower()).strip("_")
+_SLUG_SAFE_CHARS = re.compile(r"[^A-Za-z0-9._+-]+")
+
+
+def _slug_token(text: Any, *, preserve_dashes: bool = False) -> str:
+    """Normalise *text* into a safe slug token.
+
+    Lowercases and strips surrounding whitespace.  By default every run of
+    characters outside ``[a-z0-9_]`` collapses to a single underscore
+    (historic behaviour).  When *preserve_dashes* is true, hyphens, dots and
+    plus signs are kept verbatim so identifiers such as ``b-c``, ``v1.2`` or
+    ``c++`` survive a persistence roundtrip unchanged; only genuinely unsafe
+    characters are replaced.
+    """
+    raw = str(text or "").strip()
+    if preserve_dashes:
+        token = _SLUG_SAFE_CHARS.sub("_", raw).strip("._-+")
+        return token or "model"
+    token = re.sub(r"[^a-z0-9]+", "_", raw.lower()).strip("_")
     return token or "model"
 
 
@@ -2334,6 +2350,19 @@ class StackTrace:
     raw: str = ""
 
     def __post_init__(self) -> None:
+        # Accept plain mappings/lists at construction time so callers (and the
+        # persistence layer's to_dict/from_dict roundtrip) can supply raw data.
+        coerced: List["StackFrame"] = []
+        for position, frame in enumerate(self.frames):
+            if isinstance(frame, StackFrame):
+                coerced.append(frame)
+            elif isinstance(frame, Mapping):
+                coerced.append(StackFrame.from_dict(frame))
+            else:
+                raise InvalidValueError(
+                    f"stack frame #{position} must be a StackFrame or mapping, "
+                    f"got {type(frame).__name__}")
+        object.__setattr__(self, "frames", coerced)
         self.frames.sort(key=lambda frame: frame.index)
 
     def __len__(self) -> int:
@@ -2799,7 +2828,29 @@ class Corpus:
         if int(self.max_input_bytes) <= 0:
             raise InvalidValueError("max_input_bytes must be positive")
 
-    def add(self, entry: CorpusEntry) -> CorpusEntry:
+    def add(self, entry: "CorpusEntry | bytes | str", *, name: str = "",
+            path: str = "") -> CorpusEntry:
+        """Add a seed to the corpus.
+
+        Accepts either a fully built :class:`CorpusEntry` or raw in-memory
+        content (``bytes``/``str``) together with an optional ``name``; a file
+        on disk can be ingested by passing ``path=``.  Content-based seeds are
+        hashed immediately so dedup works without touching the filesystem.
+        """
+        if not isinstance(entry, CorpusEntry):
+            payload = entry
+            digest = sha256_bytes(payload if isinstance(payload, bytes)
+                                  else str(payload).encode("utf-8", "replace"))
+            entry = CorpusEntry(
+                path=path,
+                content_hash=digest,
+                size_bytes=len(payload if isinstance(payload, bytes)
+                               else str(payload).encode("utf-8", "replace")),
+                label=name or (os.path.basename(path) if path else ""),
+                origin="memory" if not path else "file",
+            )
+        elif name and not entry.label:
+            entry.label = name
         if entry.size_bytes > self.max_input_bytes:
             raise InvalidValueError(
                 f"seed '{entry.label}' is {entry.size_bytes} bytes, exceeding the corpus limit of {self.max_input_bytes}",
@@ -3324,7 +3375,7 @@ class Target:
             except Exception:
                 raise InvalidValueError(f"unknown sanitizer '{sanitizer}'", details={"allowed": SanitizerKind.tokens()})
         self.sanitizers_enabled = list(dict.fromkeys(cleaned))
-        self.tags = list(dict.fromkeys(_slug_token(t) for t in self.tags if str(t).strip()))
+        self.tags = list(dict.fromkeys(_slug_token(t, preserve_dashes=True) for t in self.tags if str(t).strip()))
 
     @property
     def authorized(self) -> bool:
@@ -3467,7 +3518,7 @@ class Crash:
             raise InvalidValueError("crash input size cannot be negative")
         if int(self.occurrence_count) < 1:
             object.__setattr__(self, "occurrence_count", 1)
-        self.labels = list(dict.fromkeys(_slug_token(t) for t in self.labels if str(t).strip()))
+        self.labels = list(dict.fromkeys(_slug_token(t, preserve_dashes=True) for t in self.labels if str(t).strip()))
 
     def stack_signature(self, depth: int = 4) -> str:
         return self.stack_trace.signature(depth=depth)
@@ -3906,7 +3957,7 @@ class Campaign:
         self.crash_dir = normalize_path(self.crash_dir) if self.crash_dir else ""
         self.work_dir = normalize_path(self.work_dir) if self.work_dir else ""
         self.log_path = normalize_path(self.log_path) if self.log_path else ""
-        self.labels = list(dict.fromkeys(_slug_token(t) for t in self.labels if str(t).strip()))
+        self.labels = list(dict.fromkeys(_slug_token(t, preserve_dashes=True) for t in self.labels if str(t).strip()))
 
     @property
     def running(self) -> bool:
@@ -4281,7 +4332,7 @@ class Finding:
             except Exception:
                 resolved_triggers.append(TriggerCondition.UNKNOWN.value)
         self.trigger_conditions = list(dict.fromkeys(resolved_triggers))
-        self.labels = list(dict.fromkeys(_slug_token(t) for t in self.labels if str(t).strip()))
+        self.labels = list(dict.fromkeys(_slug_token(t, preserve_dashes=True) for t in self.labels if str(t).strip()))
 
     def transition(self, new_state: Any, *, actor: str = "", note: str = "") -> "Finding":
         """Move through the finding lifecycle, enforcing legal transitions."""

@@ -244,33 +244,92 @@ PROHIBITED_PERSISTENCE_TOKENS = (
 )
 
 
+def _iter_guard_surfaces(obj: Any):
+    """Yield ``(label_text, metadata)`` pairs to inspect on *obj*.
+
+    Handles three shapes uniformly:
+
+    * SQLAlchemy ORM rows – every mapped column whose value is a string or a
+      list of strings is scanned for prohibited markers, plus ``labels``/
+      ``tags``/``metadata_json`` style containers.
+    * Plain mappings – all values are considered.
+    * Arbitrary objects (duck-typed guards in callers/tests) – any public
+      string attribute plus ``labels``/``tags``/``metadata`` attributes.
+    """
+    if isinstance(obj, Mapping):
+        text = " ".join(str(v) for v in obj.values())
+        yield text, None
+        return
+
+    mapper = None
+    try:
+        from sqlalchemy.orm import class_mapper
+        mapper = class_mapper(type(obj), configure=False)
+    except Exception:
+        mapper = None
+
+    if mapper is not None:
+        texts: List[str] = []
+        metadata = None
+        for column in mapper.columns:
+            key = column.key
+            value = getattr(obj, key, None)
+            if value is None:
+                continue
+            if isinstance(value, str):
+                texts.append(value)
+            elif isinstance(value, (list, tuple)):
+                texts.extend(str(item) for item in value)
+            elif isinstance(value, Mapping) and ("meta" in key or "json" in key):
+                metadata = value
+        for attr in ("labels", "tags"):
+            extra = getattr(obj, attr, None)
+            if isinstance(extra, (list, tuple)):
+                texts.extend(str(item) for item in extra)
+        yield " ".join(texts), metadata
+        return
+
+    texts = []
+    metadata = None
+    for attr in ("labels", "tags", "capability", "kind", "name", "notes",
+                 "description", "summary"):
+        value = getattr(obj, attr, None)
+        if isinstance(value, str):
+            texts.append(value)
+        elif isinstance(value, (list, tuple)):
+            texts.extend(str(item) for item in value)
+    for meta_attr in ("metadata_json", "metadata"):
+        candidate = getattr(obj, meta_attr, None)
+        if isinstance(candidate, Mapping):
+            metadata = candidate
+            break
+    yield " ".join(texts), metadata
+
+
 def guard_row_policy(obj: Any) -> None:
     """Refuse to persist anything carrying prohibited-capability markers.
 
-    Called from SQLAlchemy ``before_insert``/``before_update`` hooks.  This
-    is defence-in-depth: even if some upstream code path produced a hostile
-    label/metadata string, it will not silently enter the research database.
+    Called from SQLAlchemy ``before_flush``; also safe to call directly on a
+    mapping or an arbitrary object as a pre-flight check.  This is defence-in-
+    depth: even if some upstream code path produced a hostile label/metadata
+    string, it will not silently enter the research database.
     """
-    labels: Iterable[Any] = ()
-    metadata: Any = None
-    for attr in ("labels", "tags"):
-        value = getattr(obj, attr, None)
-        if isinstance(value, (list, tuple)):
-            labels = list(labels) + list(value)
-    meta_attr = getattr(obj, "metadata_json", None)
-    if isinstance(meta_attr, Mapping):
-        metadata = meta_attr
-    blob = " ".join(str(x).lower() for x in labels)
-    if metadata is not None:
-        blob += " " + json.dumps(metadata, default=str).lower()
-    for token in PROHIBITED_PERSISTENCE_TOKENS:
-        if token in blob:
-            raise ProhibitedCapabilityError(
-                f"refusing to persist row {type(obj).__name__}: "
-                f"prohibited capability marker '{token}'",
-                component="database.models",
-                context={"table": getattr(type(obj), "__tablename__", "?")},
-            )
+    for blob_text, metadata in _iter_guard_surfaces(obj):
+        blob = blob_text.lower()
+        if metadata is not None:
+            try:
+                blob += " " + json.dumps(metadata, default=str).lower()
+            except (TypeError, ValueError):  # pragma: no cover - defensive
+                blob += " " + str(metadata).lower()
+        table = getattr(type(obj), "__tablename__", "?")
+        for token in PROHIBITED_PERSISTENCE_TOKENS:
+            if token in blob:
+                raise ProhibitedCapabilityError(
+                    f"refusing to persist row {type(obj).__name__}: "
+                    f"prohibited capability marker '{token}'",
+                    component="database.models",
+                    context={"table": table},
+                )
 
 
 class GuardedInsertHooks:
@@ -1277,13 +1336,21 @@ class TelemetryRow(Base):
 
 
 class EvidenceRow(Base):
-    """Standalone evidence artifacts attached to findings."""
+    """Standalone evidence artifacts attached to findings.
+
+    ``subject`` names the entity the artifact belongs to (a finding, crash or
+    campaign id); ``capability`` optionally records which defensive capability
+    produced it — a free-text field that the row guard actively polices, so a
+    value such as ``shellcode_generation`` can never be persisted.
+    """
 
     __tablename__ = "evidence"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     finding_id: Mapped[Optional[str]] = mapped_column(
         ForeignKey("findings.id", ondelete="CASCADE"), nullable=True, index=True)
+    subject: Mapped[str] = mapped_column(String(128), default="", index=True)
+    capability: Mapped[str] = mapped_column(String(128), default="")
     kind: Mapped[str] = mapped_column(String(48), default="artifact")
     path: Mapped[str] = mapped_column(String(1024), default="")
     content_hash: Mapped[str] = mapped_column(String(80), default="", index=True)
