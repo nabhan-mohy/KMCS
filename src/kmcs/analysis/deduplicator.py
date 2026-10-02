@@ -168,6 +168,19 @@ def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
 
 
+_CONFIDENCE_ORDER = {
+    "unknown": 0, "low": 1, "medium": 2, "high": 3, "confirmed": 4,
+}
+
+
+def _confidence_rank(value: Any) -> int:
+    """Rank a Confidence-ish value (core enum lacks a rank classmethod)."""
+    if value is None:
+        return 0
+    token = value.value if isinstance(value, Confidence) else str(value)
+    return _CONFIDENCE_ORDER.get(token.strip().lower().replace("_", "-"), 0)
+
+
 def _as_crash(value: Any) -> Crash:
     """Coerce parse-outcome entries (crashes or reports) to Crash records."""
     if isinstance(value, Crash):
@@ -500,7 +513,7 @@ class DeduplicationResult:
             if by == "recent":
                 return (0, "", _invert_time(group.last_seen_at))
             return (-Severity.rank(group.severity),
-                    -Confidence.rank(group.confidence), group.first_seen_at)
+                    -_confidence_rank(group.confidence), group.first_seen_at)
         return sorted(self.groups, key=key)
 
     def findings(self, *, analyst: str = "kmcs-dedup") -> List[Finding]:
@@ -1285,7 +1298,7 @@ class Deduplicator:
             if crash.input_hash:
                 s += int(weights.get("has_input_hash", 0))
             s += int(weights.get("severity_rank", 0)) * Severity.rank(crash.severity) // 5
-            s += int(weights.get("confidence_rank", 0)) * Confidence.rank(crash.confidence) // 4
+            s += int(weights.get("confidence_rank", 0)) * _confidence_rank(crash.confidence) // 4
             return (s, crash.first_seen_at or "~")
 
         best = max(group.members, key=score)
@@ -1349,11 +1362,15 @@ def deduplicate_crashes(crashes: Iterable[Any], *,
                         config: Optional[DedupConfig] = None,
                         index: Optional[FingerprintIndex] = None,
                         **kw: Any) -> DeduplicationResult:
-    """One-shot batch deduplication (fresh engine unless *index* given)."""
-    if config is not None or index is not None:
-        engine = Deduplicator(config=config, index=index)
-    else:
-        engine = _default_deduplicator()
+    """One-shot batch deduplication.
+
+    Honesty note: this helper always builds a *fresh* engine so that repeated
+    calls are independent -- no hidden cross-run state can silently swallow
+    crashes into an invisible "skipped" bucket.  Callers who genuinely want
+    cross-run memory should construct a :class:`Deduplicator` themselves and
+    pass a persistent ``index`` to :meth:`Deduplicator.deduplicate`.
+    """
+    engine = Deduplicator(config=config, index=index)
     return engine.deduplicate(crashes, **kw)
 
 
