@@ -93,6 +93,7 @@ __all__ = [
     "RawCrashRecord",
     "detect_sanitizer_banner",
     "parse_crash_log",
+    "parse_sanitizer_output",
     "split_reports",
     "self_test_report",
     "Symbolizer",
@@ -1226,6 +1227,48 @@ def parse_crash_log(text_or_path: str | os.PathLike[str], *, is_path: bool = Fal
     if is_path or (os.path.sep in str(text_or_path) and os.path.exists(str(text_or_path))):
         return parser.parse_file(str(text_or_path), **meta)
     return parser.parse_text(str(text_or_path), **meta)
+
+
+def parse_sanitizer_output(text_or_path: "str | os.PathLike[str]",
+                           *, auto_symbolize: bool = True,
+                           **meta: Any) -> List["RawCrashRecord"]:
+    """Convenience facade over :class:`CrashParser` for sanitizer logs.
+
+    Accepts either the *text* of a sanitizer report (ASan / UBSan / LSan / MSan /
+    TSan output, possibly containing several concatenated reports) or a filesystem
+    path to such a log.  Returns the list of parsed :class:`RawCrashRecord` objects
+    -- one per detected report -- so callers can iterate crashes directly::
+
+        from kmcs.analysis.crash_parser import parse_sanitizer_output
+        for rep in parse_sanitizer_output(open("test_asan.log").read()):
+            print(rep.sanitizer, rep.crash_class, len(rep.stack_trace.frames))
+
+    ``auto_symbolize`` enables best-effort resolution of raw module+offset frames
+    using real tools (``llvm-symbolizer``/``addr2line``) when they are present on
+    PATH; absent tools simply leave frames unresolved.  Any additional keyword
+    arguments are passed through as metadata onto the crash record (target_name,
+    campaign_id, ...).
+    """
+    parser = _default_parser()
+    if auto_symbolize:
+        try:
+            parser.symbolizer = symbolizer_for_environment("auto")
+        except Exception:  # pragma: no cover - defensive: keep NullSymbolizer
+            pass
+    outcome = parse_crash_log(text_or_path, **meta)
+    reports = list(outcome.reports)
+    # De-duplicate identical reports that may arise from overlapping banners while
+    # preserving deterministic order (first occurrence wins).
+    seen: set = set()
+    unique: List[SanitizerReport] = []
+    for rep in reports:
+        key = (rep.sanitizer, rep.crash_class, rep.headline,
+               tuple(f.function for f in getattr(rep.stack_trace, "frames", ())[:6]))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(rep)
+    return unique
 
 
 # ============================================================================

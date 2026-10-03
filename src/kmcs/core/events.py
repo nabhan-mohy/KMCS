@@ -71,6 +71,7 @@ __all__ = [
     "FNV1a",
     "InMemorySink",
     "JsonLineFileSink",
+    "Event",
     "Record",
     "SubscriberHandle",
     "Topic",
@@ -464,6 +465,13 @@ class Record:
 
     def __json__(self) -> Dict[str, Any]:  # used by json.dumps(default=...)
         return self.to_dict()
+
+
+# Backwards/forwards compatibility alias.  Downstream subsystems (campaigns,
+# corpus, reproduction) import the event record under the shorter name ``Event``.
+# ``Record`` remains the canonical class name; ``Event`` is an identical alias so
+# ``isinstance(x, Record) is isinstance(x, Event)`` holds everywhere.
+Event = Record
 
 
 # --------------------------------------------------------------------------- #
