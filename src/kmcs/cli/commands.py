@@ -1148,44 +1148,150 @@ def _list_crash_files(workspace: Workspace) -> List[Path]:
     )
 
 
+def _fingerprint_digest(value: Any) -> Optional[str]:
+    """Return a stable hex digest string from a fingerprint value.
+
+    Accepts a raw string, a mapping with a ``digest`` key, or an
+    object exposing a ``digest`` attribute. Returns None when no
+    digest can be extracted.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value or None
+    if isinstance(value, Mapping):
+        digest = value.get("digest")
+        return str(digest) if digest else None
+    digest_attr = getattr(value, "digest", None)
+    if digest_attr:
+        return str(digest_attr)
+    return None
+
+
+def _crash_to_row(crash: Any) -> Dict[str, Any]:
+    """Project a kmcs.core.models.Crash into a JSON-friendly dict.
+
+    Uses getattr defensively so that a schema change cannot break the
+    CLI. Missing fields are omitted from the resulting mapping rather
+    than filled with fabricated defaults.
+    """
+    def _get(name: str, default: Any = None) -> Any:
+        return getattr(crash, name, default)
+
+    def _coerce_list(value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple)):
+            return [str(v) for v in value]
+        return [str(value)]
+
+    row: Dict[str, Any] = {
+        "crash_id": _get("id") or _get("crash_id") or "",
+        "target_id": _get("target_id"),
+        "target_name": _get("target_name"),
+        "campaign_id": _get("campaign_id"),
+        "crash_class": _get("crash_class"),
+        "sanitizer": _get("sanitizer"),
+        "engine": _get("engine"),
+        "input_path": _get("input_path"),
+        "signal_number": _get("signal_number"),
+        "exit_code": _get("exit_code"),
+        "fingerprint": _fingerprint_digest(_get("fingerprint")),
+        "state": _get("state"),
+        "severity": _get("severity"),
+        "duplicate_of": _get("duplicate_of"),
+        "canonical_id": _get("canonical_id"),
+        "notes": _get("notes"),
+        "labels": _coerce_list(_get("labels")),
+        "created_at": str(_get("created_at")) if _get("created_at") else None,
+    }
+
+    stack = _get("stack_trace")
+    if stack is not None:
+        frames = getattr(stack, "frames", None)
+        if frames is not None:
+            try:
+                row["stack_trace"] = [str(f) for f in frames]
+            except TypeError:
+                row["stack_trace"] = str(stack)
+        elif isinstance(stack, (list, tuple)):
+            row["stack_trace"] = [str(f) for f in stack]
+        else:
+            row["stack_trace"] = str(stack)
+
+    return {k: v for k, v in row.items() if v is not None}
+
+
 def cmd_crash_list(ctx: CommandContext) -> int:
-    """List crash records saved in the workspace."""
+    """List crash records from the workspace database."""
+    args = ctx.args
     console = ctx.console
-    records: List[Dict[str, Any]] = []
-    for path in _list_crash_files(ctx.workspace):
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                payload = json.load(fh)
-        except (OSError, json.JSONDecodeError):
-            continue
-        if isinstance(payload, dict):
-            payload.setdefault("crash_id", path.stem)
-            records.append(payload)
+
+    try:
+        from kmcs.database.database import DatabaseManager
+    except ImportError as exc:
+        raise SubsystemUnavailableError("database", str(exc)) from exc
+
+    db_path = ctx.workspace.root / "kmcs.db"
+    db = DatabaseManager(str(db_path))
+    try:
+        db.initialize()
+    except Exception as exc:  # noqa: BLE001
+        raise OperationFailedError(
+            f"failed to open workspace database at {db_path}: {exc}"
+        ) from exc
+
+    # Optional filters, tolerant of parsers that do not define them.
+    filters: Dict[str, Any] = {}
+    for name, key in (
+        ("campaign", "campaign_id"),
+        ("target", "target_id"),
+        ("crash_class", "crash_class"),
+        ("state", "state"),
+        ("severity", "severity"),
+    ):
+        value = getattr(args, name, None)
+        if value:
+            filters[key] = value
+    limit = getattr(args, "limit", None)
+    if limit:
+        filters["limit"] = int(limit)
+
+    try:
+        crashes = db.list_crashes(**filters)
+    except Exception as exc:  # noqa: BLE001
+        raise OperationFailedError(f"failed to query crashes: {exc}") from exc
+
+    rows = [_crash_to_row(c) for c in (crashes or [])]
 
     if console.json_mode:
-        console.emit_json({"crashes": records})
+        console.emit_json({"crashes": rows, "count": len(rows)})
         return int(ExitCode.SUCCESS)
 
-    if not records:
+    if not rows:
         console.out("No crashes recorded.")
         return int(ExitCode.SUCCESS)
 
-    console.out(f"{len(records)} crash(es):")
+    console.out(f"{len(rows)} crash(es):")
     console.out("")
-    header = f"{'ID':<24} {'SIGNAL':<8} {'EXIT':<6} {'FINGERPRINT':<20} TITLE"
+    header = f"{'ID':<42} {'SIGNAL':<8} {'EXIT':<6} {'FINGERPRINT':<20} CLASS"
     console.out(header)
     console.out("-" * len(header))
-    for rec in records:
-        cid = str(rec.get("crash_id", "?"))[:23]
-        signal = rec.get("signal_number", "-")
-        exit_code = rec.get("exit_code", "-")
-        fp = rec.get("fingerprint", "")
-        fp_short = (fp[:16] + "...") if isinstance(fp, str) and len(fp) > 16 else (fp or "-")
-        title = rec.get("title") or rec.get("classification") or ""
+    for row in rows:
+        cid = str(row.get("crash_id", "?"))
+        short_id = cid if len(cid) <= 40 else cid[:37] + "..."
+        signal = row.get("signal_number", "-")
+        exit_code = row.get("exit_code", "-")
+        fp = str(row.get("fingerprint") or "")
+        fp_short = (fp[:16] + "...") if len(fp) > 16 else (fp or "-")
+        cls = str(row.get("crash_class") or "")
         console.out(
-            f"{cid:<24} {str(signal):<8} {str(exit_code):<6} {fp_short:<20} {title}"
+            f"{short_id:<42} {str(signal):<8} {str(exit_code):<6} "
+            f"{fp_short:<20} {cls}"
         )
     return int(ExitCode.SUCCESS)
+
+
 
 
 def _ensure_target_row_for_command(db: Any, target_command: str) -> Optional[str]:
@@ -1431,33 +1537,54 @@ def _classify_afl_crash(filename: str) -> str:
 
 
 def cmd_crash_show(ctx: CommandContext) -> int:
-    """Show one crash record."""
+    """Show one crash record from the workspace database."""
     args = ctx.args
     console = ctx.console
-    path = ctx.workspace.crashes_dir / f"{args.crash_id}.json"
-    if not path.exists():
-        raise ResourceNotFoundError("crash", args.crash_id)
+
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            payload = json.load(fh)
-    except (OSError, json.JSONDecodeError) as exc:
+        from kmcs.database.database import DatabaseManager
+    except ImportError as exc:
+        raise SubsystemUnavailableError("database", str(exc)) from exc
+
+    db_path = ctx.workspace.root / "kmcs.db"
+    db = DatabaseManager(str(db_path))
+    try:
+        db.initialize()
+    except Exception as exc:  # noqa: BLE001
         raise OperationFailedError(
-            f"failed to read crash record {path}: {exc}"
+            f"failed to open workspace database at {db_path}: {exc}"
         ) from exc
 
+    crash = None
+    try:
+        crash = db.get_crash(args.crash_id)
+    except Exception:
+        # The ORM may raise when the row does not exist; treat that
+        # as a not-found condition rather than a failure.
+        crash = None
+
+    if crash is None:
+        raise ResourceNotFoundError("crash", args.crash_id)
+
+    row = _crash_to_row(crash)
+
     if console.json_mode:
-        console.emit_json(payload)
+        console.emit_json(row)
         return int(ExitCode.SUCCESS)
 
-    console.out(f"Crash: {args.crash_id}")
-    for key in sorted(payload.keys()):
-        value = payload[key]
+    console.out(f"Crash: {row.get('crash_id', args.crash_id)}")
+    for key in sorted(row.keys()):
+        value = row[key]
         if isinstance(value, (dict, list)):
             console.out(f"  {key}:")
-            console.out(textwrap.indent(json.dumps(value, indent=2, default=str), "    "))
+            rendered = json.dumps(value, indent=2, default=str)
+            for line in rendered.splitlines():
+                console.out("    " + line)
         else:
             console.out(f"  {key}: {value}")
     return int(ExitCode.SUCCESS)
+
+
 
 
 # ---------------------------------------------------------------------------
