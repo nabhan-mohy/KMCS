@@ -139,8 +139,9 @@ from typing import (
 )
 
 from ..core.exceptions import KMCSException
-from ..core.events import EventBus, Event, EventType, get_default_bus
-from ..core.config import KMCSConfig, get_default_config
+from ..core.events import EventBus, EventType
+from .._events_compat import Event, get_default_bus, publish_event
+from ..core.config import KmcsConfig, get_config
 
 if TYPE_CHECKING:
     from .manager import Campaign
@@ -1105,7 +1106,7 @@ class CampaignTelemetry:
         Optional event bus for publishing telemetry updates. When
         omitted, the process-wide default bus is used.
     config:
-        Optional :class:`~kmcs.core.config.KMCSConfig`.
+        Optional :class:`~kmcs.core.config.KmcsConfig`.
     sample_interval:
         Seconds between automatic samples. Ignored if
         ``auto_sample=False``.
@@ -1127,7 +1128,7 @@ class CampaignTelemetry:
         campaign: "Campaign",
         *,
         event_bus: Optional[EventBus] = None,
-        config: Optional[KMCSConfig] = None,
+        config: Optional[KmcsConfig] = None,
         sample_interval: float = DEFAULT_SAMPLE_INTERVAL_SECONDS,
         history_capacity: int = DEFAULT_HISTORY_CAPACITY,
         auto_sample: bool = True,
@@ -1142,7 +1143,7 @@ class CampaignTelemetry:
 
         self._campaign = campaign
         self._bus = event_bus or get_default_bus()
-        self._config = config or get_default_config()
+        self._config = config or get_config()
         self._sample_interval = float(sample_interval)
         self._history_capacity = int(history_capacity)
         self._auto_sample = bool(auto_sample)
@@ -1225,7 +1226,7 @@ class CampaignTelemetry:
                 source="campaigns.telemetry",
                 data={"event": event_name, **payload},
             )
-            self._bus.publish(event)
+            publish_event(self._bus, event)
         except Exception as exc:  # noqa: BLE001
             logger.debug("telemetry event publish failed: %s", exc)
 

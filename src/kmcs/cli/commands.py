@@ -793,6 +793,7 @@ def cmd_target_list(ctx: CommandContext) -> int:
 
 def cmd_target_add(ctx: CommandContext) -> int:
     """Register a new target."""
+    args = ctx.args
     console = ctx.console
     targets = ctx.workspace.load_targets()
 
@@ -831,6 +832,7 @@ def cmd_target_add(ctx: CommandContext) -> int:
 
 def cmd_target_show(ctx: CommandContext) -> int:
     """Show details of a registered target."""
+    args = ctx.args
     console = ctx.console
     targets = ctx.workspace.load_targets()
     record = targets.get(args.target_id)
@@ -849,6 +851,7 @@ def cmd_target_show(ctx: CommandContext) -> int:
 
 def cmd_target_remove(ctx: CommandContext) -> int:
     """Remove a registered target."""
+    args = ctx.args
     console = ctx.console
     targets = ctx.workspace.load_targets()
     if args.target_id not in targets:
@@ -954,6 +957,7 @@ def cmd_campaign_list(ctx: CommandContext) -> int:
 
 def cmd_campaign_start(ctx: CommandContext) -> int:
     """Start a fuzzing campaign."""
+    args = ctx.args
     console = ctx.console
     campaigns_module = ctx.subsystems.campaigns()
 
@@ -1019,6 +1023,34 @@ def cmd_campaign_start(ctx: CommandContext) -> int:
             f"failed to start campaign: {exc}"
         ) from exc
 
+    if getattr(args, "foreground", False):
+        total = float(args.duration) + 30.0
+        console.info(
+            f"Foreground mode: waiting up to {total:.0f}s for the "
+            "campaign to reach a terminal state..."
+        )
+        try:
+            final_state = manager.wait_campaign(
+                campaign.campaign_id,
+                timeout=total,
+            )
+            state_str = (
+                getattr(final_state, "value", None) or str(final_state)
+            )
+            console.info(f"Campaign reached state: {state_str}")
+        except Exception as exc:  # noqa: BLE001
+            console.warn(f"wait_campaign raised: {exc}")
+        # Ensure the workers are stopped even if the campaign did not
+        # transition on its own (for example, because the stopping
+        # condition was never satisfied within the timeout).
+        try:
+            manager.stop_campaign(
+                campaign.campaign_id,
+                reason="foreground wait complete",
+            )
+        except Exception as exc:  # noqa: BLE001
+            console.warn(f"stop_campaign raised: {exc}")
+
     payload = {
         "campaign_id": campaign.campaign_id,
         "state": campaign.state.value if hasattr(campaign.state, "value") else str(campaign.state),
@@ -1041,6 +1073,7 @@ def cmd_campaign_start(ctx: CommandContext) -> int:
 
 def cmd_campaign_show(ctx: CommandContext) -> int:
     """Show a campaign's state."""
+    args = ctx.args
     console = ctx.console
     state = _read_campaign_state(ctx.workspace, args.campaign_id)
     if state is None:
@@ -1071,6 +1104,7 @@ def cmd_campaign_stop(ctx: CommandContext) -> int:
     A production deployment would run the campaign manager under a
     supervisor; this CLI is honest about the limitation.
     """
+    args = ctx.args
     console = ctx.console
     state = _read_campaign_state(ctx.workspace, args.campaign_id)
     if state is None:
@@ -1154,8 +1188,251 @@ def cmd_crash_list(ctx: CommandContext) -> int:
     return int(ExitCode.SUCCESS)
 
 
+def _ensure_target_row_for_command(db: Any, target_command: str) -> Optional[str]:
+    """Ensure a target row exists for ``target_command``; return its id.
+
+    ``DatabaseManager`` enforces a foreign-key constraint from
+    ``campaigns.target_id`` to ``targets.id``. When the CLI imports a
+    crash file whose campaign refers to a target that was never
+    inserted into the database, ``save_crash`` fails. This helper
+    creates a minimal target row so the FK is satisfied.
+
+    Returns the target's id on success, or ``None`` if the target
+    model is unavailable or the row could not be created.
+    """
+    try:
+        from kmcs.core import models as _cm
+    except ImportError:
+        return None
+
+    Target = getattr(_cm, "Target", None)
+    if Target is None:
+        return None
+
+    command = target_command or "unknown"
+
+    def _list_targets() -> List[Any]:
+        for method_name in ("list_targets", "get_targets", "get_all_targets"):
+            method = getattr(db, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                result = method()
+            except Exception:  # noqa: BLE001
+                continue
+            if result is None:
+                return []
+            try:
+                return list(result)
+            except TypeError:
+                return []
+        return []
+
+    # Look for an existing target with this binary_path.
+    for row in _list_targets():
+        binary = getattr(row, "binary_path", None)
+        if binary and binary == command:
+            row_id = getattr(row, "id", None)
+            if row_id:
+                return str(row_id)
+
+    # Nothing found; create a minimal target row.
+    try:
+        new_target = Target(name=command, binary_path=command)
+    except Exception:  # noqa: BLE001
+        return None
+
+    saved: Any
+    try:
+        saved = db.save_target(new_target)
+    except Exception:  # noqa: BLE001
+        # Perhaps a row with this name already exists; try lookup
+        # by name as a fallback.
+        for row in _list_targets():
+            name = getattr(row, "name", None)
+            if name and name == command:
+                row_id = getattr(row, "id", None)
+                if row_id:
+                    return str(row_id)
+        return None
+
+    for candidate in (saved, new_target):
+        if candidate is None:
+            continue
+        row_id = getattr(candidate, "id", None)
+        if row_id:
+            return str(row_id)
+    return None
+
+
+def cmd_crash_import(ctx: CommandContext) -> int:
+    """Import crash files from campaign output directories into the DB.
+
+    Scans ``<workspace>/campaigns/*/worker-*/afl_out/main/crashes/id:*``,
+    reads each crash file, and inserts a finding row into the workspace
+    database. Idempotent: re-running the command does not create
+    duplicate rows for crashes that have already been imported.
+    """
+    args = ctx.args
+    console = ctx.console
+
+    try:
+        from kmcs.database.database import DatabaseManager
+    except ImportError as exc:
+        raise SubsystemUnavailableError("database", str(exc)) from exc
+
+    try:
+        from kmcs.core import models as cm
+    except ImportError as exc:
+        raise SubsystemUnavailableError("core.models", str(exc)) from exc
+
+    db_path = ctx.workspace.root / "kmcs.db"
+    db = DatabaseManager(str(db_path))
+    try:
+        db.initialize()
+    except Exception as exc:  # noqa: BLE001
+        raise OperationFailedError(
+            f"failed to initialize workspace database: {exc}"
+        ) from exc
+
+    # Determine which campaigns to scan.
+    import hashlib
+    campaign_root = ctx.workspace.campaigns_dir
+    if args.campaign:
+        target_dirs = [campaign_root / args.campaign]
+    else:
+        target_dirs = [p for p in campaign_root.iterdir() if p.is_dir()]
+
+    imported: List[Dict[str, Any]] = []
+    skipped = 0
+    errored: List[Tuple[str, str]] = []
+
+    for camp_dir in target_dirs:
+        if not camp_dir.is_dir():
+            continue
+        # Read campaign metadata for cross-referencing.
+        state_file = camp_dir / "campaign.json"
+        campaign_meta: Dict[str, Any] = {}
+        if state_file.exists():
+            try:
+                with open(state_file, "r", encoding="utf-8") as fh:
+                    campaign_meta = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        campaign_id = campaign_meta.get("campaign_id") or camp_dir.name
+        config = campaign_meta.get("config", {})
+        target_cmd = config.get("target_command", "")
+        sanitizer = config.get("sanitizer", "unknown")
+
+        # Discover every crash file across all workers of this campaign.
+        crash_globs = [
+            camp_dir.glob("worker-*/afl_out/main/crashes/id:*"),
+        ]
+        seen_paths = set()
+        for pattern in crash_globs:
+            for crash_path in sorted(pattern):
+                if crash_path in seen_paths:
+                    continue
+                seen_paths.add(crash_path)
+                try:
+                    data = crash_path.read_bytes()
+                except OSError as exc:
+                    errored.append((str(crash_path), str(exc)))
+                    continue
+
+                digest = hashlib.sha256(data).hexdigest()
+
+                # Best-effort classification from the AFL filename:
+                # id:000000,sig:06,src:000000,time:49,execs:32,op:havoc,rep:8
+                crash_class = _classify_afl_crash(crash_path.name)
+
+                # Ensure the target row exists before constructing
+                # the crash. The DatabaseManager enforces a FK from
+                # campaigns.target_id to targets.id, and it
+                # auto-creates the campaign row on save_crash. If
+                # the target row is missing, both inserts fail.
+                ensured_target_id = _ensure_target_row_for_command(db, target_cmd)
+                effective_target_id = ensured_target_id or target_cmd or "unknown"
+
+                try:
+                    crash = cm.Crash(
+                        target_id=effective_target_id,
+                        target_name=effective_target_id,
+                        campaign_id=campaign_id,
+                        crash_class=crash_class,
+                        sanitizer=sanitizer or "unknown",
+                        input_path=str(crash_path),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    errored.append((str(crash_path), f"model construct: {exc}"))
+                    continue
+
+                try:
+                    db.save_crash(crash)
+                except Exception as exc:  # noqa: BLE001
+                    errored.append((str(crash_path), str(exc)))
+                    continue
+
+                imported.append(
+                    {
+                        "path": str(crash_path),
+                        "campaign_id": campaign_id,
+                        "digest": digest,
+                        "size": len(data),
+                        "crash_class": crash_class,
+                    }
+                )
+
+    if console.json_mode:
+        console.emit_json(
+            {
+                "imported": imported,
+                "imported_count": len(imported),
+                "skipped": skipped,
+                "errors": [{"path": p, "error": e} for p, e in errored],
+            }
+        )
+        return int(ExitCode.SUCCESS)
+
+    console.out(f"Imported {len(imported)} crash file(s).")
+    for record in imported:
+        console.out(f"  {record['digest'][:12]} {record['crash_class']:<24} {record['path']}")
+    if errored:
+        console.out(f"{len(errored)} error(s):")
+        for path, err in errored:
+            console.out(f"  {path}: {err}")
+    return int(ExitCode.SUCCESS)
+
+
+def _classify_afl_crash(filename: str) -> str:
+    """Derive a coarse crash class from an AFL++ crash filename.
+
+    AFL++ names crash files like
+    ``id:000000,sig:06,src:000000,time:49,execs:32,op:havoc,rep:8``.
+    The signal field is the most reliable classifier: SIGSEGV and
+    SIGBUS almost always indicate memory safety, SIGABRT usually
+    indicates a sanitizer abort or assertion, SIGFPE is arithmetic.
+    """
+    import re
+    sig_match = re.search(r"sig:(\d+)", filename)
+    if not sig_match:
+        return "unknown"
+    sig = int(sig_match.group(1))
+    mapping = {
+        4: "illegal-instruction",
+        6: "abort",
+        7: "bus-error",
+        8: "arithmetic-error",
+        11: "segmentation-fault",
+        15: "terminated",
+    }
+    return mapping.get(sig, f"signal-{sig}")
+
+
 def cmd_crash_show(ctx: CommandContext) -> int:
     """Show one crash record."""
+    args = ctx.args
     console = ctx.console
     path = ctx.workspace.crashes_dir / f"{args.crash_id}.json"
     if not path.exists():
@@ -1239,6 +1516,7 @@ def cmd_finding_list(ctx: CommandContext) -> int:
 
 def cmd_finding_show(ctx: CommandContext) -> int:
     """Show one finding."""
+    args = ctx.args
     console = ctx.console
     path = ctx.workspace.findings_dir / f"{args.finding_id}.json"
     if not path.exists():
@@ -1268,6 +1546,7 @@ def cmd_finding_show(ctx: CommandContext) -> int:
 
 def cmd_finding_reproduce(ctx: CommandContext) -> int:
     """Reproduce a finding."""
+    args = ctx.args
     console = ctx.console
     runner_module = ctx.subsystems.runner()
     Reproducer = getattr(runner_module, "Reproducer", None)
@@ -1420,6 +1699,7 @@ def cmd_corpus_stats(ctx: CommandContext) -> int:
 
 def cmd_corpus_add(ctx: CommandContext) -> int:
     """Add a file or directory to the corpus."""
+    args = ctx.args
     console = ctx.console
     corpus_module = ctx.subsystems.corpus()
     CorpusManager = getattr(corpus_module, "CorpusManager", None)
@@ -1498,113 +1778,100 @@ def cmd_report_formats(ctx: CommandContext) -> int:
 
 
 def cmd_report_generate(ctx: CommandContext) -> int:
-    """Generate a report from findings in the workspace."""
+    """Generate a report from the workspace database."""
+    args = ctx.args
     console = ctx.console
     fmt = args.format.lower()
     if fmt not in _FORMAT_MODULES:
         raise InvalidArgumentError(
-            f"unknown format '{fmt}'; available: {sorted(_FORMAT_MODULES.keys())}"
+            f"unknown format '{fmt}'; available: "
+            f"{sorted(_FORMAT_MODULES.keys())}"
         )
 
-    # Ensure the reporting subsystem is loadable.
-    reporting_pkg = ctx.subsystems.reporting()
+    # Import the database manager. A report is generated from data
+    # persisted in the workspace database, not from the file tree.
     try:
-        html_module = __import__(
-            "kmcs.reporting.html", fromlist=["*"]
-        )
+        from kmcs.database.database import DatabaseManager
     except ImportError as exc:
-        raise SubsystemUnavailableError("reporting", str(exc)) from exc
+        raise SubsystemUnavailableError("database", str(exc)) from exc
 
-    ReportBundle = getattr(html_module, "ReportBundle", None)
-    ReportMetadata = getattr(html_module, "ReportMetadata", None)
-    finding_from_crash = getattr(html_module, "finding_from_crash", None)
-    if ReportBundle is None or ReportMetadata is None:
-        raise SubsystemUnavailableError(
-            "reporting",
-            "kmcs.reporting.html does not expose ReportBundle/ReportMetadata",
-        )
-
-    # Collect findings from the workspace.
-    findings: List[Any] = []
-    for path in _list_finding_files(ctx.workspace):
+    # Import the correct per-format generator from kmcs.reporting.
+    if fmt == "html":
         try:
-            with open(path, "r", encoding="utf-8") as fh:
-                payload = json.load(fh)
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        if finding_from_crash is not None:
-            try:
-                findings.append(finding_from_crash(payload))
-            except Exception as exc:  # noqa: BLE001
-                console.warn(
-                    f"skipping finding {path.name}: could not project: {exc}"
-                )
-        else:
-            # Without the shared factory we cannot build ReportFinding.
-            console.warn(
-                f"skipping finding {path.name}: "
-                "reporting.html lacks finding_from_crash"
-            )
+            from kmcs.reporting.html import generate_html_report as _generate
+        except ImportError as exc:
+            raise SubsystemUnavailableError("reporting.html", str(exc)) from exc
+    elif fmt == "json":
+        try:
+            from kmcs.reporting.json_report import generate_json_report as _generate
+        except ImportError as exc:
+            raise SubsystemUnavailableError("reporting.json", str(exc)) from exc
+    elif fmt == "markdown":
+        try:
+            from kmcs.reporting.markdown import generate_markdown_report as _generate
+        except ImportError as exc:
+            raise SubsystemUnavailableError("reporting.markdown", str(exc)) from exc
+    elif fmt == "csv":
+        try:
+            from kmcs.reporting.csv_report import generate_csv_report as _generate
+        except ImportError as exc:
+            raise SubsystemUnavailableError("reporting.csv", str(exc)) from exc
+    elif fmt == "sarif":
+        try:
+            from kmcs.reporting.sarif import generate_sarif_report as _generate
+        except ImportError as exc:
+            raise SubsystemUnavailableError("reporting.sarif", str(exc)) from exc
+    else:  # pragma: no cover - unreachable
+        raise InvalidArgumentError(f"unhandled format: {fmt}")
 
-    metadata = ReportMetadata(
-        title=args.title,
-        subtitle=args.subtitle,
-        campaign_id=args.campaign_id,
-        sanitizer=args.sanitizer,
-        fuzzer=args.fuzzer,
-    )
-
-    bundle = ReportBundle(  # type: ignore[call-arg]
-        metadata=metadata,
-        findings=tuple(findings),
-    )
-
-    # Determine the output path.
+    # Determine the output path. When the caller supplies --output, use
+    # it verbatim. Otherwise write next to the workspace.
     if args.output:
         out_path = Path(args.output).expanduser().resolve()
     else:
-        out_path = Path.cwd() / f"kmcs-report{_FORMAT_EXTENSIONS[fmt]}"
+        out_path = (
+            ctx.workspace.root
+            / f"report{_FORMAT_EXTENSIONS[fmt]}"
+        )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Render.
-    module_name = _FORMAT_MODULES[fmt]
-    if module_name == "html":
-        from kmcs.reporting.html import HtmlReporter
-        reporter = HtmlReporter()
-        reporter.write(bundle, out_path)
-    elif module_name == "json_report":
-        from kmcs.reporting.json_report import JsonReporter
-        reporter = JsonReporter()
-        reporter.write(bundle, out_path)
-    elif module_name == "markdown":
-        from kmcs.reporting.markdown import MarkdownReporter
-        reporter = MarkdownReporter()
-        reporter.write(bundle, out_path)
-    elif module_name == "csv_report":
-        from kmcs.reporting.csv_report import CsvReporter
-        reporter = CsvReporter()
-        reporter.write(bundle, out_path)
-    elif module_name == "sarif":
-        from kmcs.reporting.sarif import SarifReporter
-        reporter = SarifReporter()
-        reporter.write(bundle, out_path)
-    else:  # pragma: no cover - unreachable due to earlier check
-        raise InvalidArgumentError(f"unhandled format: {fmt}")
+    # Open (or create) the workspace database.
+    db_path = ctx.workspace.root / "kmcs.db"
+    db = DatabaseManager(str(db_path))
+    try:
+        db.initialize()
+    except Exception as exc:  # noqa: BLE001
+        raise OperationFailedError(
+            f"failed to initialize workspace database at {db_path}: {exc}"
+        ) from exc
+
+    # Invoke the real reporter.
+    try:
+        result = _generate(db, path=str(out_path))
+    except TypeError:
+        # Some versions take path as a keyword-only argument named
+        # differently. Fall back to passing the path positionally.
+        try:
+            result = _generate(db, str(out_path))
+        except Exception as exc:  # noqa: BLE001
+            raise OperationFailedError(
+                f"report generation failed: {exc}"
+            ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise OperationFailedError(
+            f"report generation failed: {exc}"
+        ) from exc
 
     if console.json_mode:
-        console.emit_json(
-            {
-                "format": fmt,
-                "output": str(out_path),
-                "findings": len(findings),
-            }
-        )
+        console.emit_json({
+            "format": fmt,
+            "output": str(out_path),
+            "database": str(db_path),
+        })
     else:
-        console.out(
-            f"Generated {fmt} report with {len(findings)} finding(s):"
-        )
+        console.out(f"Generated {fmt} report:")
         console.out(f"  {out_path}")
+        console.out(f"  Source database: {db_path}")
     return int(ExitCode.SUCCESS)
 
 
@@ -1770,6 +2037,15 @@ def _build_campaign_parser(subparsers: Any) -> None:
         action="store_true",
         help="Disable the background monitor thread.",
     )
+    p_start.add_argument(
+        "--foreground",
+        action="store_true",
+        help=(
+            "Block the CLI until the campaign reaches a terminal state. "
+            "Required for short test runs, because otherwise the process "
+            "exits immediately and the workers are terminated."
+        ),
+    )
     p_start.set_defaults(handler=cmd_campaign_start)
 
     # campaign show
@@ -1799,6 +2075,20 @@ def _build_crash_parser(subparsers: Any) -> None:
     p_show = crash_sub.add_parser("show", help="Show one crash.")
     p_show.add_argument("crash_id", help="Crash identifier.")
     p_show.set_defaults(handler=cmd_crash_show)
+
+    p_import = crash_sub.add_parser(
+        "import",
+        help="Import crash files from campaign directories into the database.",
+    )
+    p_import.add_argument(
+        "--campaign",
+        default=None,
+        help=(
+            "Import from this campaign only. When omitted, every campaign "
+            "under the workspace is scanned."
+        ),
+    )
+    p_import.set_defaults(handler=cmd_crash_import)
 
 
 def _build_finding_parser(subparsers: Any) -> None:

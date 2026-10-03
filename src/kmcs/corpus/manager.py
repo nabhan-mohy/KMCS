@@ -93,8 +93,9 @@ from typing import (
 )
 
 from ..core.exceptions import KMCSException
-from ..core.events import EventBus, Event, EventType, get_default_bus
-from ..core.config import KMCSConfig, get_default_config
+from ..core.events import EventBus, EventType
+from .._events_compat import Event, get_default_bus, publish_event
+from ..core.config import KmcsConfig, get_config
 from ..core.models import CorpusEntry as CoreCorpusEntry
 
 # Optional imports — the manager must remain importable even when the
@@ -601,7 +602,7 @@ class CorpusManager:
         where ``<aa>`` is the first two hex characters of the digest
         (a sharding scheme to keep directory sizes reasonable).
     config:
-        Optional :class:`~kmcs.core.config.KMCSConfig`. When omitted, the
+        Optional :class:`~kmcs.core.config.KmcsConfig`. When omitted, the
         process-wide default configuration is used.
     database:
         Optional :class:`~kmcs.database.database.DatabaseManager`. When
@@ -631,7 +632,7 @@ class CorpusManager:
         self,
         root: Union[str, os.PathLike[str]],
         *,
-        config: Optional[KMCSConfig] = None,
+        config: Optional[KmcsConfig] = None,
         database: Optional["DatabaseManager"] = None,
         event_bus: Optional[EventBus] = None,
         max_file_size: int = DEFAULT_MAX_FILE_SIZE,
@@ -647,7 +648,7 @@ class CorpusManager:
             raise ValueError("chunk_size must be positive")
 
         self._root = Path(root).expanduser().resolve()
-        self._config = config or get_default_config()
+        self._config = config or get_config()
         self._database = database
         self._bus = event_bus or get_default_bus()
         self._max_file_size = int(max_file_size)
@@ -746,7 +747,7 @@ class CorpusManager:
         """Emit an event on the corpus bus, ignoring subscriber errors."""
         try:
             event = Event(type=event_type, source="corpus.manager", data=payload)
-            self._bus.publish(event)
+            publish_event(self._bus, event)
         except Exception as exc:  # noqa: BLE001 - subscribers are untrusted
             logger.warning("corpus event publish failed: %s", exc)
 

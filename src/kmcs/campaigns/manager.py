@@ -106,8 +106,9 @@ from typing import (
 )
 
 from ..core.exceptions import KMCSException
-from ..core.events import EventBus, Event, EventType, get_default_bus
-from ..core.config import KMCSConfig, get_default_config
+from ..core.events import EventBus, EventType
+from .._events_compat import Event, get_default_bus, publish_event
+from ..core.config import KmcsConfig, get_config
 
 if TYPE_CHECKING:
     from .worker import CampaignWorker
@@ -774,7 +775,7 @@ class CampaignManager:
     Parameters
     ----------
     config:
-        Optional :class:`~kmcs.core.config.KMCSConfig` used for
+        Optional :class:`~kmcs.core.config.KmcsConfig` used for
         platform-level defaults.
     database:
         Optional :class:`~kmcs.database.database.DatabaseManager`. When
@@ -807,7 +808,7 @@ class CampaignManager:
     def __init__(
         self,
         *,
-        config: Optional[KMCSConfig] = None,
+        config: Optional[KmcsConfig] = None,
         database: Optional[Any] = None,
         event_bus: Optional[EventBus] = None,
         worker_factory: Optional[WorkerFactory] = None,
@@ -822,7 +823,7 @@ class CampaignManager:
         if default_stop_timeout <= 0:
             raise ValueError("default_stop_timeout must be positive")
 
-        self._config = config or get_default_config()
+        self._config = config or get_config()
         self._database = database
         self._bus = event_bus or get_default_bus()
         self._worker_factory = worker_factory
@@ -846,7 +847,7 @@ class CampaignManager:
     # ------------------------------------------------------------------
 
     @property
-    def config(self) -> KMCSConfig:
+    def config(self) -> KmcsConfig:
         return self._config
 
     @property
@@ -880,7 +881,7 @@ class CampaignManager:
                 source="campaigns.manager",
                 data={"event": event_name, **payload},
             )
-            self._bus.publish(event)
+            publish_event(self._bus, event)
         except Exception as exc:  # noqa: BLE001 - subscribers are untrusted
             logger.warning("campaign event publish failed: %s", exc)
 
@@ -889,7 +890,30 @@ class CampaignManager:
     # ------------------------------------------------------------------
 
     def _persist_campaign(self, campaign: Campaign) -> None:
-        """Persist a campaign snapshot to the database, if attached."""
+        """Persist a campaign snapshot to disk and, if attached, to the database.
+
+        The on-disk ``campaign.json`` state file is always written so
+        that the file's contents match the manager's in-memory state
+        at every transition. The database write is best-effort: it is
+        skipped when no database is attached, and any failure is
+        logged without aborting the caller.
+        """
+        # Always write the state file first; this is the authoritative
+        # artifact for CLI tools that read campaign state from disk.
+        try:
+            output_dir = campaign.output_dir
+            output_dir.mkdir(parents=True, exist_ok=True)
+            self._write_json(
+                output_dir / _OUTPUT_STATE_FILE,
+                campaign.to_dict(),
+            )
+        except OSError as exc:
+            logger.debug(
+                "failed to write campaign state file for %s: %s",
+                campaign.campaign_id,
+                exc,
+            )
+
         if self._database is None:
             return
         writer = getattr(self._database, "upsert_campaign", None) or getattr(
@@ -900,7 +924,11 @@ class CampaignManager:
         try:
             writer(campaign.to_dict())
         except Exception as exc:  # noqa: BLE001 - DB failure must not abort
-            logger.debug("failed to persist campaign %s: %s", campaign.campaign_id, exc)
+            logger.debug(
+                "failed to persist campaign %s to database: %s",
+                campaign.campaign_id,
+                exc,
+            )
 
     # ------------------------------------------------------------------
     # Filesystem layout

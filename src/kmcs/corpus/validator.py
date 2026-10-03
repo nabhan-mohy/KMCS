@@ -91,8 +91,9 @@ from typing import (
 )
 
 from ..core.exceptions import KMCSException
-from ..core.events import EventBus, Event, EventType, get_default_bus
-from ..core.config import KMCSConfig, get_default_config
+from ..core.events import EventBus, EventType
+from .._events_compat import Event, get_default_bus, publish_event
+from ..core.config import KmcsConfig, get_config
 
 # Optional structural parser. When present, we delegate crash
 # interpretation to it; when absent, we simply record the raw fields.
@@ -572,7 +573,7 @@ class InputValidator:
     target:
         The :class:`TargetSpec` describing the target binary.
     config:
-        Optional :class:`~kmcs.core.config.KMCSConfig`.
+        Optional :class:`~kmcs.core.config.KmcsConfig`.
     event_bus:
         Optional event bus. When omitted, the process-wide default bus
         is used.
@@ -585,12 +586,12 @@ class InputValidator:
         self,
         target: TargetSpec,
         *,
-        config: Optional[KMCSConfig] = None,
+        config: Optional[KmcsConfig] = None,
         event_bus: Optional[EventBus] = None,
         scratch_dir: Optional[Union[str, os.PathLike[str]]] = None,
     ) -> None:
         self._target = target
-        self._config = config or get_default_config()
+        self._config = config or get_config()
         self._bus = event_bus or get_default_bus()
         self._scratch_owner = scratch_dir is None
         if scratch_dir is None:
@@ -631,7 +632,7 @@ class InputValidator:
     def _emit(self, event_type: EventType, payload: Dict[str, Any]) -> None:
         try:
             event = Event(type=event_type, source="corpus.validator", data=payload)
-            self._bus.publish(event)
+            publish_event(self._bus, event)
         except Exception as exc:  # noqa: BLE001 - subscribers are untrusted
             logger.warning("validator event publish failed: %s", exc)
 
@@ -1151,7 +1152,7 @@ def make_reproduction_predicate(
     target_spec: TargetSpec,
     expected_behavior: ExpectedBehavior,
     *,
-    config: Optional[KMCSConfig] = None,
+    config: Optional[KmcsConfig] = None,
     event_bus: Optional[EventBus] = None,
 ) -> Callable[[bytes], bool]:
     """Return a predicate suitable for the minimizer.

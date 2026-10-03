@@ -125,8 +125,9 @@ from typing import (
 )
 
 from ..core.exceptions import KMCSException
-from ..core.events import EventBus, Event, EventType, get_default_bus
-from ..core.config import KMCSConfig, get_default_config
+from ..core.events import EventBus, EventType
+from .._events_compat import Event, get_default_bus, publish_event
+from ..core.config import KmcsConfig, get_config
 
 
 __all__ = [
@@ -584,7 +585,7 @@ class InputMinimizer:
     min_size:
         Minimum accepted length of any reduced candidate.
     config:
-        Optional :class:`~kmcs.core.config.KMCSConfig`.
+        Optional :class:`~kmcs.core.config.KmcsConfig`.
     event_bus:
         Optional event bus. When omitted, the process-wide default bus
         is used.
@@ -607,7 +608,7 @@ class InputMinimizer:
         token_pattern: Union[str, bytes] = DEFAULT_TOKEN_PATTERN,
         padding_bytes: FrozenSet[int] = DEFAULT_PADDING_BYTES,
         min_size: int = DEFAULT_MIN_SIZE,
-        config: Optional[KMCSConfig] = None,
+        config: Optional[KmcsConfig] = None,
         event_bus: Optional[EventBus] = None,
         work_dir: Optional[Union[str, os.PathLike[str]]] = None,
         enable_caching: bool = True,
@@ -630,7 +631,7 @@ class InputMinimizer:
         self._time_budget = float(time_budget_seconds)
         self._chunk_size = int(chunk_size)
         self._min_size = int(min_size)
-        self._config = config or get_default_config()
+        self._config = config or get_config()
         self._bus = event_bus or get_default_bus()
         self._enable_caching = bool(enable_caching)
 
@@ -699,7 +700,7 @@ class InputMinimizer:
     def _emit(self, event_type: EventType, payload: Dict[str, Any]) -> None:
         try:
             event = Event(type=event_type, source="corpus.minimizer", data=payload)
-            self._bus.publish(event)
+            publish_event(self._bus, event)
         except Exception as exc:  # noqa: BLE001 - subscribers are untrusted
             logger.warning("minimizer event publish failed: %s", exc)
 

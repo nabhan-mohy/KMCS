@@ -112,8 +112,9 @@ from typing import (
 )
 
 from ..core.exceptions import KMCSException
-from ..core.events import EventBus, Event, EventType, get_default_bus
-from ..core.config import KMCSConfig, get_default_config
+from ..core.events import EventBus, EventType
+from .._events_compat import Event, get_default_bus, publish_event
+from ..core.config import KmcsConfig, get_config
 
 
 # ---------------------------------------------------------------------------
@@ -795,7 +796,7 @@ class RegressionStore:
     event_bus:
         Optional :class:`~kmcs.core.events.EventBus`.
     config:
-        Optional :class:`~kmcs.core.config.KMCSConfig`.
+        Optional :class:`~kmcs.core.config.KmcsConfig`.
     """
 
     def __init__(
@@ -805,7 +806,7 @@ class RegressionStore:
         history_limit: int = DEFAULT_HISTORY_LIMIT,
         max_input_bytes: int = DEFAULT_MAX_INPUT_BYTES,
         event_bus: Optional[EventBus] = None,
-        config: Optional[KMCSConfig] = None,
+        config: Optional[KmcsConfig] = None,
     ) -> None:
         if history_limit <= 0:
             raise ValueError("history_limit must be positive")
@@ -817,7 +818,7 @@ class RegressionStore:
         self._history_limit = int(history_limit)
         self._max_input_bytes = int(max_input_bytes)
         self._bus = event_bus or get_default_bus()
-        self._config = config or get_default_config()
+        self._config = config or get_config()
 
         self._lock = threading.RLock()
         self._cache: Dict[str, RegressionCase] = {}
@@ -872,7 +873,7 @@ class RegressionStore:
                 source="reproduction.regression",
                 data={"event": event_name, **payload},
             )
-            self._bus.publish(event)
+            publish_event(self._bus, event)
         except Exception as exc:  # noqa: BLE001 - subscribers are untrusted
             logger.debug("regression event publish failed: %s", exc)
 
@@ -1612,7 +1613,7 @@ class RegressionRunner:
     event_bus:
         Optional :class:`~kmcs.core.events.EventBus`.
     kmcs_config:
-        Optional :class:`~kmcs.core.config.KMCSConfig`.
+        Optional :class:`~kmcs.core.config.KmcsConfig`.
     """
 
     def __init__(
@@ -1624,7 +1625,7 @@ class RegressionRunner:
         validator: Optional["InputValidator"] = None,
         reproducer: Optional["Reproducer"] = None,
         event_bus: Optional[EventBus] = None,
-        kmcs_config: Optional[KMCSConfig] = None,
+        kmcs_config: Optional[KmcsConfig] = None,
     ) -> None:
         if not _HAVE_RUNNER:
             raise RegressionRunnerNotAvailableError(_RUNNER_IMPORT_ERROR)
@@ -1633,7 +1634,7 @@ class RegressionRunner:
         self._target = target
         self._config = config or ReproductionConfig()
         self._bus = event_bus or get_default_bus()
-        self._kmcs_config = kmcs_config or get_default_config()
+        self._kmcs_config = kmcs_config or get_config()
 
         self._owns_reproducer = reproducer is None
         if reproducer is not None:

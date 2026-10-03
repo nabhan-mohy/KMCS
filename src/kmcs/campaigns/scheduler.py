@@ -141,8 +141,9 @@ from typing import (
 )
 
 from ..core.exceptions import KMCSException
-from ..core.events import EventBus, Event, EventType, get_default_bus
-from ..core.config import KMCSConfig, get_default_config
+from ..core.events import EventBus, EventType
+from .._events_compat import Event, get_default_bus, publish_event
+from ..core.config import KmcsConfig, get_config
 
 if TYPE_CHECKING:
     pass
@@ -651,7 +652,7 @@ class Scheduler:
     policy:
         Initial :class:`SchedulingPolicy`. Defaults to FIFO.
     config:
-        Optional :class:`~kmcs.core.config.KMCSConfig`.
+        Optional :class:`~kmcs.core.config.KmcsConfig`.
     event_bus:
         Optional :class:`~kmcs.core.events.EventBus`. When omitted,
         the process-wide default bus is used.
@@ -677,7 +678,7 @@ class Scheduler:
         max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
         *,
         policy: Union[SchedulingPolicy, str] = SchedulingPolicy.FIFO,
-        config: Optional[KMCSConfig] = None,
+        config: Optional[KmcsConfig] = None,
         event_bus: Optional[EventBus] = None,
         auto_dispatch: bool = True,
         dispatch_interval: float = DEFAULT_DISPATCH_INTERVAL_SECONDS,
@@ -700,7 +701,7 @@ class Scheduler:
 
         self._max_concurrency = int(max_concurrency)
         self._policy = _coerce_policy(policy)
-        self._config = config or get_default_config()
+        self._config = config or get_config()
         self._bus = event_bus or get_default_bus()
         self._auto_dispatch = bool(auto_dispatch)
         self._dispatch_interval = float(dispatch_interval)
@@ -764,7 +765,7 @@ class Scheduler:
             return self._state
 
     @property
-    def config(self) -> KMCSConfig:
+    def config(self) -> KmcsConfig:
         return self._config
 
     # ------------------------------------------------------------------
@@ -789,7 +790,7 @@ class Scheduler:
                 source="campaigns.scheduler",
                 data={"event": event_name, **payload},
             )
-            self._bus.publish(event)
+            publish_event(self._bus, event)
         except Exception as exc:  # noqa: BLE001 - subscribers are untrusted
             logger.debug("scheduler event publish failed: %s", exc)
 

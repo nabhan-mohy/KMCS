@@ -152,8 +152,9 @@ from typing import (
 )
 
 from ..core.exceptions import KMCSException
-from ..core.events import EventBus, Event, EventType, get_default_bus
-from ..core.config import KMCSConfig, get_default_config
+from ..core.events import EventBus, EventType
+from .._events_compat import Event, get_default_bus, publish_event
+from ..core.config import KmcsConfig, get_config
 
 if TYPE_CHECKING:
     from .manager import Campaign, CampaignConfig
@@ -763,7 +764,7 @@ class CampaignWorker:
         Optional event bus. When omitted, the process-wide default bus
         is used.
     platform_config:
-        Optional :class:`~kmcs.core.config.KMCSConfig` for
+        Optional :class:`~kmcs.core.config.KmcsConfig` for
         platform-level defaults.
     """
 
@@ -772,7 +773,7 @@ class CampaignWorker:
         config: WorkerConfig,
         *,
         event_bus: Optional[EventBus] = None,
-        platform_config: Optional[KMCSConfig] = None,
+        platform_config: Optional[KmcsConfig] = None,
     ) -> None:
         if not isinstance(config, WorkerConfig):
             raise TypeError(
@@ -781,7 +782,7 @@ class CampaignWorker:
 
         self._config = config
         self._bus = event_bus or get_default_bus()
-        self._platform_config = platform_config or get_default_config()
+        self._platform_config = platform_config or get_config()
 
         self._lock = threading.RLock()
         self._state = WorkerState.PENDING
@@ -887,7 +888,7 @@ class CampaignWorker:
                 source="campaigns.worker",
                 data={"event": event_name, **payload},
             )
-            self._bus.publish(event)
+            publish_event(self._bus, event)
         except Exception as exc:  # noqa: BLE001 - subscribers are untrusted
             logger.debug("worker event publish failed: %s", exc)
 

@@ -150,8 +150,9 @@ from typing import (
 )
 
 from ..core.exceptions import KMCSException
-from ..core.events import EventBus, Event, EventType, get_default_bus
-from ..core.config import KMCSConfig, get_default_config
+from ..core.events import EventBus, EventType
+from .._events_compat import Event, get_default_bus, publish_event
+from ..core.config import KmcsConfig, get_config
 
 
 # ---------------------------------------------------------------------------
@@ -1057,7 +1058,7 @@ class Reproducer:
     event_bus:
         Optional :class:`~kmcs.core.events.EventBus`.
     kmcs_config:
-        Optional :class:`~kmcs.core.config.KMCSConfig`.
+        Optional :class:`~kmcs.core.config.KmcsConfig`.
     validator:
         Optional pre-built :class:`~kmcs.corpus.validator.InputValidator`.
         When omitted, the runner constructs one from ``target``. This
@@ -1073,7 +1074,7 @@ class Reproducer:
         reference: Optional[Union["ExpectedBehavior", "ValidationOutcome", ReferenceSignature]] = None,
         config: Optional[ReproductionConfig] = None,
         event_bus: Optional[EventBus] = None,
-        kmcs_config: Optional[KMCSConfig] = None,
+        kmcs_config: Optional[KmcsConfig] = None,
         validator: Optional["InputValidator"] = None,
     ) -> None:
         _require_validator()
@@ -1083,7 +1084,7 @@ class Reproducer:
                 "either target or validator must be provided"
             )
 
-        self._kmcs_config = kmcs_config or get_default_config()
+        self._kmcs_config = kmcs_config or get_config()
         self._bus = event_bus or get_default_bus()
         self._config = config or ReproductionConfig()
 
@@ -1745,7 +1746,7 @@ class Reproducer:
                 source="reproduction.runner",
                 data={"event": event_name, **payload},
             )
-            self._bus.publish(event)
+            publish_event(self._bus, event)
         except Exception as exc:  # noqa: BLE001 - subscribers are untrusted
             logger.debug("reproduction event publish failed: %s", exc)
 
@@ -1796,7 +1797,7 @@ def reproduce_once(
     *,
     timeout_seconds: Optional[float] = None,
     event_bus: Optional[EventBus] = None,
-    kmcs_config: Optional[KMCSConfig] = None,
+    kmcs_config: Optional[KmcsConfig] = None,
 ) -> ReproductionResult:
     """Run ``data`` once and return a single-attempt result.
 
@@ -1830,7 +1831,7 @@ def reproduce_with_retries(
     preserve_evidence: bool = False,
     evidence_root: Optional[str] = None,
     event_bus: Optional[EventBus] = None,
-    kmcs_config: Optional[KMCSConfig] = None,
+    kmcs_config: Optional[KmcsConfig] = None,
 ) -> ReproductionResult:
     """Run ``data`` ``runs`` times and classify the result.
 
