@@ -1,1 +1,6 @@
-(empty)
+# Python compiled files
+__pycache__/
+*.pyc
+
+# Database files
+*.db
