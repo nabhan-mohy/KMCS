@@ -709,8 +709,9 @@ def truncate(data: Any, *, keep: Optional[int] = None, rng: Any = None,
 
 
 def extend(data: Any, *, count: Optional[int] = None, fill: int = 0x00,
-           rng: Any = None, limits: Optional=MutationLimits if False else Optional[MutationLimits] = None) -> MutationResult:
+           rng: Any = None, limits: Optional[MutationLimits] = None) -> MutationResult:
     """Append filler bytes up to the configured output cap."""
+    limits = limits or MutationLimits.DEFAULT
     payload = validate_payload(data, limits=limits)
     generator = seeded_rng(rng)
     room = limits.max_output_bytes - len(payload)
